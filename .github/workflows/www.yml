@@ -79,7 +79,7 @@ jobs:
         run: |
           mkdir -p "$CONFIG"
           cd "$CONFIG"
-          git clone https://github.com/kuonji-arisu/android_kernel_xiaomi_sm8750.git -b main --depth=1
+          git clone https://github.com/kuonji-arisu/android_kernel_xiaomi_sm8750.git --depth=1 common
 
       - name: Extract Kernel SUBLEVEL
         id: sublevel
