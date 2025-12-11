@@ -73,7 +73,7 @@ jobs:
 
       - name: Clone AnyKernel3 (no extra patches)
         run: |
-          git clone https://github.com/adamspaini/AnyKernel3.git -b axtra
+          git clone https://github.com/adamspaini/AnyKernel3..git -b axtra
 
       - name: Clone Custom Kernel Source
         run: |
