@@ -73,15 +73,19 @@ jobs:
 
       - name: Clone AnyKernel3 (no extra patches)
         run: |
-          git clone https://github.com/adamspaini/AnyKernel3..git -b axtra
+          git clone https://github.com/adamspaini/AnyKernel3.git -b axtra
 
-      - name: Initialize and Sync Kernel Source
+      - name: Clone Custom Kernel Source
         run: |
           mkdir -p "$CONFIG"
           cd "$CONFIG"
-          FORMATTED_BRANCH="android15-6.6-$OS_PATCH_LEVEL"
-          $REPO init -u https://android.googlesource.com/kernel/manifest -b common-${FORMATTED_BRANCH} --repo-rev=v2.16 --depth=1
-          $REPO sync -c -j$(nproc) --no-tags --fail-fast
+          # Clone the custom kernel repository
+          git clone https://github.com/kuonji-arisu/android_kernel_xiaomi_sm8750.git common
+          cd common
+          
+          # Set up git identity for commits
+          git config user.email "ci@github.com"
+          git config user.name "GitHub Actions CI"
 
       - name: Extract Kernel SUBLEVEL
         id: sublevel
@@ -98,15 +102,25 @@ jobs:
             sed -i '/#include <trace\/hooks\/blk.h>/a #include <trace\/hooks\/fs.h>' ./fs/namespace.c || true
           fi
 
-      - name: Disable check_defconfig
-        run: |
-          cd "$CONFIG"
-          sed -i 's/check_defconfig//' ./common/build.config.gki
-
       - name: Configure Kernel Features (vanilla-friendly)
         run: |
-          cd "$CONFIG"
-          DEFCONFIG=common/arch/arm64/configs/gki_defconfig
+          cd "$CONFIG/common"
+          DEFCONFIG=arch/arm64/configs/gki_defconfig
+          
+          # Check if gki_defconfig exists, if not try to find the device config
+          if [ ! -f "$DEFCONFIG" ]; then
+            echo "Warning: gki_defconfig not found, searching for device config..."
+            # Look for config files in typical locations
+            DEVICE_CONFIG=$(find arch/arm64/configs -name "*vendor*" -o -name "*defconfig*" | head -1)
+            if [ -n "$DEVICE_CONFIG" ]; then
+              DEFCONFIG="$DEVICE_CONFIG"
+              echo "Using device config: $DEFCONFIG"
+            else
+              echo "Error: No config file found"
+              exit 1
+            fi
+          fi
+          
           {
             echo "# Mountify"
             echo "CONFIG_TMPFS_XATTR=y"
@@ -139,106 +153,140 @@ jobs:
             echo '# CONFIG_LOCALVERSION_AUTO is not set'
           } >> "$DEFCONFIG"
 
-          sed -i '/_COMMON_GKI_MODULES_LIST = \\[/,/\\]/ s/\\]/    "sound\/drivers\/snd-aloop.ko",\n&/' common/modules.bzl
+      - name: Add HymoFS Support
+        run: |
+          cd "$CONFIG/common"
+          
+          # Download and apply HymoFS patch
+          echo "Downloading HymoFS patch..."
+          wget https://raw.githubusercontent.com/Anatdx/HymoFS/refs/heads/main/patch/hymofs.patch
+          
+          echo "Applying HymoFS patch..."
+          patch -p1 -F 3 < hymofs.patch || {
+            echo "Patch application may have warnings, continuing..."
+          }
+          
+          # Add HymoFS to defconfig
+          echo "Adding HymoFS to defconfig..."
+          DEFCONFIG=arch/arm64/configs/gki_defconfig
+          if [ ! -f "$DEFCONFIG" ]; then
+            DEVICE_CONFIG=$(find arch/arm64/configs -name "*vendor*" -o -name "*defconfig*" | head -1)
+            if [ -n "$DEVICE_CONFIG" ]; then
+              DEFCONFIG="$DEVICE_CONFIG"
+            fi
+          fi
+          
+          echo "CONFIG_HYMOFS=y" >> "$DEFCONFIG"
+          
+          # Clean up
+          rm -f hymofs.patch
 
-      - name: Clean Bazel exports
+      - name: Clean Bazel exports (if applicable)
         run: |
           cd "$CONFIG"
-          sed -i "/stable_scmversion_cmd/s/-maybe-dirty//g" ./build/kernel/kleaf/impl/stamp.bzl || true
-          rm -rf ./common/android/abi_gki_protected_exports_* || true
-          perl -pi -e 's/^\s*"protected_exports_list"\s*:\s*"android\/abi_gki_protected_exports_aarch64",\s*$//;' ./common/BUILD.bazel || true
+          if [ -f "./build/kernel/kleaf/impl/stamp.bzl" ]; then
+            sed -i "/stable_scmversion_cmd/s/-maybe-dirty//g" ./build/kernel/kleaf/impl/stamp.bzl || true
+          fi
+          
+          if [ -d "./common/android" ]; then
+            rm -rf ./common/android/abi_gki_protected_exports_* || true
+          fi
+          
+          if [ -f "./common/BUILD.bazel" ]; then
+            perl -pi -e 's/^\s*"protected_exports_list"\s*:\s*"android\/abi_gki_protected_exports_aarch64",\s*$//;' ./common/BUILD.bazel || true
+          fi
 
       - name: Set custom build host
         run: |
           cd "$CONFIG"
-          sed -i 's|export KBUILD_BUILD_HOST=.*|export KBUILD_BUILD_HOST=byben|' build/kernel/_setup_env.sh
+          if [ -f "build/kernel/_setup_env.sh" ]; then
+            sed -i 's|export KBUILD_BUILD_HOST=.*|export KBUILD_BUILD_HOST=byben|' build/kernel/_setup_env.sh
+          else
+            echo "export KBUILD_BUILD_HOST=byben" > common/Makefile.env
+          fi
 
       - name: Customize kernel localversion output
         run: |
           cd "$CONFIG/common"
-          sed -i 's|echo "${KERNELVERSION}${file_localversion}${config_localversion}${LOCALVERSION}${scm_version}"|echo "${KERNELVERSION}${config_localversion}"|' ./scripts/setlocalversion
-
-      - name: Integrate SukiSU
-        run: |
-          cd "$CONFIG/common"
-          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
-
-      - name: Add support SUSFS
-        run: |
-          cd "$CONFIG/common"
-          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-main
-          cd ../
-          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 --depth=1
-          cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
-          cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
-          cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch ./common
-          cd common
-    
-          # Aplicar el patch con opciones para resolver conflictos
-          patch -p1 --verbose --reject-file=- < 50_add_susfs_in_gki-android15-6.6.patch ||        true
-    
-          # Si hay hunks fallidos, aplicar manualmente los más problemáticos
-          if [ -f fs/proc/base.c.rej ]; then
-          echo "Aplicando manualmente parches fallidos en fs/proc/base.c..."
-          # Aplicar manualmente los cambios necesarios para fs/proc/base.c
-          # Esto es un workaround para el hunk que falla en la línea 100
-          sed -i '100i#ifdef CONFIG_KSU_SUSFS' fs/proc/base.c
-          sed -i '101i#include <linux/susfs.h>' fs/proc/base.c
-          sed -i '102i#endif' fs/proc/base.c
+          if [ -f "./scripts/setlocalversion" ]; then
+            sed -i 's|echo "${KERNELVERSION}${file_localversion}${config_localversion}${LOCALVERSION}${scm_version}"|echo "${KERNELVERSION}${config_localversion}"|' ./scripts/setlocalversion
           fi
-    
-          # Verificar que los archivos críticos estén presentes
-          if [ ! -f fs/susfs.c ]; then
-          echo "Error: fs/susfs.c no encontrado después de aplicar parches"
-          exit 1
-          fi
-
-      - name: Configure SUSFS
-        run: |
-          cd "$CONFIG"
-          DEFCONFIG="common/arch/arm64/configs/gki_defconfig"
-
-          echo "" >> "$DEFCONFIG"
-          echo "# SUSFS Configuration" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS=y" >> "$DEFCONFIG"
-          echo "# CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT is not set" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> "$DEFCONFIG"
-
-          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y" >> "$DEFCONFIG"
-
-          echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "$DEFCONFIG"
-
-          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_SUS_SU=n" >> "$DEFCONFIG"
 
       - name: Fix Kernel Timestamp (dynamic date)
         run: |
-          cd "$CONFIG/common/init"
+          cd "$CONFIG/common"
           TIMESTAMP=$(date -u +"%a %b %d %H:%M:%S UTC %Y")
-          sed -i "s|build-timestamp = .*|build-timestamp = \"${TIMESTAMP}\"|" Makefile
+          
+          # Try different locations for timestamp
+          if [ -f "init/Makefile" ]; then
+            sed -i "s|build-timestamp = .*|build-timestamp = \"${TIMESTAMP}\"|" init/Makefile
+          elif [ -f "Makefile" ]; then
+            sed -i "s|^EXTRAVERSION =.*|EXTRAVERSION = -Axtra-GKI-${TIMESTAMP// /-}|" Makefile
+          fi
 
-      - name: Build Kernel (Bazel)
+      - name: Build Kernel (Adapted for custom kernel)
         run: |
-          cd "$CONFIG"
+          cd "$CONFIG/common"
+          
+          # Set build environment variables
           export KBUILD_BUILD_USER="Axtra"
           export KBUILD_BUILD_HOST="CI"
-          tools/bazel build --config=fast --lto=thin \
-            //common:kernel_aarch64_dist
+          export ARCH=arm64
+          export SUBARCH=arm64
+          
+          # Clean previous builds
+          make clean || true
+          make mrproper || true
+          
+          # Find and use the appropriate defconfig
+          DEFCONFIG="gki_defconfig"
+          if [ ! -f "arch/arm64/configs/$DEFCONFIG" ]; then
+            # Try to find any defconfig
+            DEFCONFIG=$(find arch/arm64/configs -name "*defconfig" | head -1 | xargs basename)
+            if [ -z "$DEFCONFIG" ]; then
+              echo "Error: No defconfig found"
+              exit 1
+            fi
+            echo "Using defconfig: $DEFCONFIG"
+          fi
+          
+          # Configure kernel
+          make $DEFCONFIG
+          
+          # Build kernel
+          make -j$(nproc) Image.gz-dtb || make -j$(nproc) Image.gz
 
       - name: Prepare AnyKernel3 Image
         run: |
-          IMG="./$CONFIG/bazel-bin/common/kernel_aarch64/Image"
-          test -f "$IMG" || (echo "Error: $IMG not found" && exit 1)
-          cp "$IMG" AnyKernel3/Image
+          cd "$CONFIG/common"
+          
+          # Look for the built kernel image
+          IMG_CANDIDATES=(
+            "arch/arm64/boot/Image.gz-dtb"
+            "arch/arm64/boot/Image.gz"
+            "arch/arm64/boot/Image"
+            "arch/arm64/boot/Image-dtb"
+          )
+          
+          KERNEL_IMG=""
+          for candidate in "${IMG_CANDIDATES[@]}"; do
+            if [ -f "$candidate" ]; then
+              KERNEL_IMG="$candidate"
+              echo "Found kernel image: $KERNEL_IMG"
+              break
+            fi
+          done
+          
+          if [ -z "$KERNEL_IMG" ]; then
+            echo "Error: No kernel image found"
+            find arch/arm64/boot/ -type f | while read file; do
+              echo "Found: $file"
+            done
+            exit 1
+          fi
+          
+          # Copy to AnyKernel3
+          cp "$KERNEL_IMG" ../../AnyKernel3/Image
 
       - name: Set release file + tag names
         id: names
@@ -253,6 +301,46 @@ jobs:
           else
             TAG="test-6.6-${DATE}-${RAND}"
             TITLE="Axtra GKI 6.6 Test (${DATE})"
+            MAKE_LATEST="false"
+          fi
+          echo "FILE_NAME=$FILE_NAME" >> $GITHUB_ENV
+          echo "RELEASE_TAG=$TAG" >> $GITHUB_ENV
+          echo "RELEASE_TITLE=$TITLE" >> $GITHUB_ENV
+          echo "MAKE_LATEST=$MAKE_LATEST" >> $GITHUB_ENV
+
+      - name: Package flashable AnyKernel zip
+        run: |
+          cd AnyKernel3
+          rm -rf .git .github || true
+          
+          # Update anykernel.sh with build info
+          sed -i "s/kernel.string=.*/kernel.string=Axtra GKI 6.6 built $(date -u +'%Y-%m-%d')/" anykernel.sh
+          
+          zip -r9 ../${{ env.FILE_NAME }}.zip . -x "*.git*" "*.github*"
+
+      - name: Build Summary
+        run: |
+          echo "# Kernel Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "## ${{ env.FILE_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Source:** kuonji-arisu/android_kernel_xiaomi_sm8750" >> $GITHUB_STEP_SUMMARY
+          echo "- **Android Version:** android15" >> $GITHUB_STEP_SUMMARY
+          echo "- **Kernel:** 6.6.${{ steps.sublevel.outputs.sublevel }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Features:** HymoFS support" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build Date:** $(date -u +'%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "- **Release Tag:** ${{ env.RELEASE_TAG }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Asset:** ${{ env.FILE_NAME }}.zip" >> $GITHUB_STEP_SUMMARY
+
+      - name: Publish GitHub Release (upload asset)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TITLE }}
+          prerelease: ${{ inputs.release_type != 'release' }}
+          draft: false
+          generate_release_notes: true
+          make_latest: ${{ env.MAKE_LATEST }}
+          files: |
+            ${{ env.FILE_NAME }}.zipAxtra GKI 6.6 Test (${DATE})"
             MAKE_LATEST="false"
           fi
           echo "FILE_NAME=$FILE_NAME" >> $GITHUB_ENV
